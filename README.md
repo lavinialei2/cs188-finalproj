@@ -70,7 +70,7 @@ cabinet_door_project/
   03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
   04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
   05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a simple MLP behavior-cloning policy
+  06_train_policy.py             # Train the starter-code diffusion policy
   07_evaluate_policy.py          # Evaluate your trained policy in simulation
   08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
   configs/
@@ -165,37 +165,36 @@ doors. This is the data your policy will learn from.
 
 ```bash
 python 06_train_policy.py
+python 06_train_policy.py --config configs/diffusion_policy.yaml
 ```
 
-Trains a simple MLP behavior-cloning policy on low-dimensional state-action
-pairs from the demonstration data. This is meant to illustrate the
-data-loading → training → checkpoint pipeline, not to produce a policy that
-can reliably solve the task.
+Trains the starter-code diffusion policy defined by
+`configs/diffusion_policy.yaml`. This implementation stays inside the project
+structure and ports over the core diffusion-policy logic for low-dimensional
+state observations:
+- condition on the last `n_obs_steps` observations
+- predict an action chunk of length `horizon`
+- train with Gaussian corruption and noise prediction
+- evaluate with receding-horizon denoising and action chunk execution
 
-For a policy that actually works, use one of the official training repos:
+Legacy options:
+- `--legacy` runs the original lightweight MLP pipeline from the starter file.
 
-```bash
-# Diffusion Policy (recommended for single-task)
-git clone https://github.com/robocasa-benchmark/diffusion_policy
-cd diffusion_policy && pip install -e .
-python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
-```
+On Apple Silicon Macs (M-series), the script will use the MPS backend when available.
 
-You can also print setup instructions for Diffusion Policy, pi-0, and GR00T
-directly from the script:
-
-```bash
-python 06_train_policy.py --use_diffusion_policy
-```
+Use only config files for tuning: edit
+`cabinet_door_project/configs/diffusion_policy.yaml` and rerun
+`python 06_train_policy.py`.
 
 ### Step 7: Evaluate Your Policy
 
 ```bash
-python 07_evaluate_policy.py --checkpoint path/to/checkpoint.pt
+python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt
+python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt --split target --num_rollouts 20
 ```
 
-Runs your trained policy in the simulation environment and reports success
-rate across multiple episodes and kitchen scenes.
+The evaluator uses observation history and receding-horizon action chunks for
+the diffusion model, so its inference path matches the training setup.
 
 ---
 
@@ -284,8 +283,10 @@ dataset/
 
 ## Research Directions
 
-The MLP baseline in `06_train_policy.py` is intentionally simple — it
-demonstrates the pipeline but will basically always fail. Here are three
+The legacy MLP baseline in `06_train_policy.py` is intentionally simple and
+will usually fail on OpenCabinet. The default starter-code diffusion model is
+meaningfully stronger, but still much smaller than the full image-conditioned
+Diffusion Policy systems in the paper. Three practical next steps:
 fun directions to improve the model:
 
 ### Minimal Diffusion Policy
