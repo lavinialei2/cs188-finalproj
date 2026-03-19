@@ -15,7 +15,6 @@ to demonstrate the data loading -> training -> checkpoint pipeline.
 
 Usage:
     python 06_train_policy.py [--epochs 50] [--batch_size 32] [--lr 1e-4]
-    python 06_train_policy.py --action_horizon 8 --ema_decay 0.999
     python 06_train_policy.py --use_diffusion_policy   # Use official repo
 """
 
@@ -95,7 +94,7 @@ def train_diffusion_policy(config):
             max_episodes=None,
             normalize_state=True,
             normalize_action=True,
-            action_horizon=1,
+            state_history=1,
         ):
             import pyarrow.parquet as pq
 
@@ -105,7 +104,7 @@ def train_diffusion_policy(config):
             self.normalize_action = normalize_action
             self.state_cols = None
             self.action_cols = None
-            self.action_horizon = max(1, int(action_horizon))
+            self.state_history = max(1, int(state_history))
 
             # Prefer augmented data if present
             aug_dir = os.path.join(dataset_path, "augmented")
@@ -211,15 +210,13 @@ def train_diffusion_policy(config):
                     if states_seq and actions_seq:
                         states_seq = np.stack(states_seq, axis=0)
                         actions_seq = np.stack(actions_seq, axis=0)
-                        max_start = len(actions_seq) - self.action_horizon + 1
-                        if max_start <= 0:
-                            continue
-                        for i in range(max_start):
-                            self.states.append(states_seq[i])
-                            action_chunk = actions_seq[
-                                i : i + self.action_horizon
+                        start = self.state_history - 1
+                        for i in range(start, len(states_seq)):
+                            state_window = states_seq[
+                                i - self.state_history + 1 : i + 1
                             ].reshape(-1)
-                            self.actions.append(action_chunk)
+                            self.states.append(state_window)
+                            self.actions.append(actions_seq[i])
 
                 episodes_loaded += 1
                 if max_episodes and episodes_loaded >= max_episodes:
@@ -274,7 +271,7 @@ def train_diffusion_policy(config):
         max_episodes=config.get("max_episodes", 50),
         normalize_state=config.get("normalize_state", True),
         normalize_action=config.get("normalize_action", True),
-        action_horizon=config.get("action_horizon", 1),
+        state_history=config.get("state_history", 1),
     )
     dataloader = DataLoader(
         dataset,
@@ -288,10 +285,14 @@ def train_diffusion_policy(config):
     # ----------------------------------------------------------------
     state_dim = dataset.states.shape[-1]
     action_dim = dataset.actions.shape[-1]
-    action_horizon = config.get("action_horizon", 1)
-    action_dim_per_step = action_dim // max(1, action_horizon)
+    state_history = config.get("state_history", 1)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"\nDevice: {device}")
 
     def _parse_channel_mults(value):
@@ -311,17 +312,6 @@ def train_diffusion_policy(config):
         time_embed_dim=config.get("time_embed_dim", 128),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
-    ema_decay = config.get("ema_decay", 0.999)
-    ema_model = UNet1D(
-        action_dim=action_dim,
-        cond_dim=state_dim,
-        base_channels=config.get("unet_channels", 64),
-        channel_mults=channel_mults,
-        time_embed_dim=config.get("time_embed_dim", 128),
-    ).to(device)
-    ema_model.load_state_dict(model.state_dict())
-    for p in ema_model.parameters():
-        p.requires_grad = False
     scheduler = DiffusionScheduler(
         num_steps=config.get("diffusion_steps", 50),
         beta_start=config.get("beta_start", 1e-4),
@@ -340,8 +330,7 @@ def train_diffusion_policy(config):
     print(f"Batch size: {config['batch_size']}")
     print(f"LR:         {config['learning_rate']}")
     print(f"Steps:      {scheduler.num_steps}")
-    print(f"Horizon:    {action_horizon}")
-    print(f"EMA decay:  {ema_decay}")
+    print(f"History:    {state_history}")
 
     checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_policy_checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -371,9 +360,6 @@ def train_diffusion_policy(config):
             loss.backward()
             optimizer.step()
 
-            with torch.no_grad():
-                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-                    ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
 
             epoch_loss += loss.item()
             num_batches += 1
@@ -412,10 +398,7 @@ def train_diffusion_policy(config):
                     "action_mean": dataset.action_mean,
                     "action_std": dataset.action_std,
                     "state_keys": dataset.state_cols,
-                    "action_horizon": action_horizon,
-                    "action_dim_per_step": action_dim_per_step,
-                    "ema_decay": ema_decay,
-                    "ema_state_dict": ema_model.state_dict(),
+                    "state_history": state_history,
                 },
                 ckpt_path,
             )
@@ -444,10 +427,7 @@ def train_diffusion_policy(config):
             "action_mean": dataset.action_mean,
             "action_std": dataset.action_std,
             "state_keys": dataset.state_cols,
-            "action_horizon": action_horizon,
-            "action_dim_per_step": action_dim_per_step,
-            "ema_decay": ema_decay,
-            "ema_state_dict": ema_model.state_dict(),
+            "state_history": state_history,
         },
         final_path,
     )
@@ -533,12 +513,6 @@ def main():
     parser.add_argument(
         "--diffusion_steps", type=int, default=50, help="Diffusion timesteps"
     )
-    parser.add_argument(
-        "--action_horizon",
-        type=int,
-        default=8,
-        help="Number of future actions to predict per step",
-    )
     parser.add_argument("--beta_start", type=float, default=1e-4, help="Beta start")
     parser.add_argument("--beta_end", type=float, default=0.02, help="Beta end")
     parser.add_argument(
@@ -554,10 +528,10 @@ def main():
         "--time_embed_dim", type=int, default=128, help="Time embedding dimension"
     )
     parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.999,
-        help="EMA decay for model weights",
+        "--state_history",
+        type=int,
+        default=1,
+        help="Number of past states to stack for each input",
     )
     parser.add_argument(
         "--no_normalize_state",
@@ -617,8 +591,7 @@ def main():
             "normalize_state": not args.no_normalize_state,
             "normalize_action": not args.no_normalize_action,
             "max_episodes": None if args.max_episodes <= 0 else args.max_episodes,
-            "action_horizon": args.action_horizon,
-            "ema_decay": args.ema_decay,
+            "state_history": args.state_history,
         }
 
     train_diffusion_policy(config)

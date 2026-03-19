@@ -87,21 +87,8 @@ def load_policy(checkpoint_path, device):
             "normalize_state": checkpoint.get("normalize_state", True),
             "normalize_action": checkpoint.get("normalize_action", True),
             "state_keys": checkpoint.get("state_keys", None),
-            "action_horizon": checkpoint.get("action_horizon", 1),
-            "action_dim_per_step": checkpoint.get("action_dim_per_step", None),
+            "state_history": checkpoint.get("state_history", 1),
         }
-        ema_state = checkpoint.get("ema_state_dict", None)
-        if ema_state is not None:
-            ema_model = UNet1D(
-                action_dim=action_dim,
-                cond_dim=state_dim,
-                base_channels=checkpoint.get("unet_channels", 64),
-                channel_mults=tuple(checkpoint.get("unet_channel_mults", (1, 2, 4))),
-                time_embed_dim=checkpoint.get("time_embed_dim", 128),
-            ).to(device)
-            ema_model.load_state_dict(ema_state)
-            ema_model.eval()
-            policy["ema_model"] = ema_model
     else:
 
         class SimplePolicy(nn.Module):
@@ -128,6 +115,7 @@ def load_policy(checkpoint_path, device):
             "type": "mlp",
             "model": model,
             "state_keys": checkpoint.get("state_keys", None),
+            "state_history": checkpoint.get("state_history", 1),
         }
 
     print(f"Loaded policy from: {checkpoint_path}")
@@ -293,7 +281,7 @@ def _unnormalize(x, mean, std, enabled):
     return x * std + mean
 
 
-def sample_diffusion_action(policy, state, device, deterministic=True, use_ema=True):
+def sample_diffusion_action(policy, state, device, deterministic=True):
     """Sample an action from a diffusion policy."""
     import torch
 
@@ -308,8 +296,6 @@ def sample_diffusion_action(policy, state, device, deterministic=True, use_ema=T
     state_tensor = torch.from_numpy(state_norm).unsqueeze(0).to(device)
 
     model = policy["model"]
-    if use_ema and "ema_model" in policy:
-        model = policy["ema_model"]
     scheduler = policy["scheduler"]
     action_dim = model.action_dim
 
@@ -352,13 +338,13 @@ def run_evaluation(
     seed,
     deterministic,
     action_reorder,
-    use_ema,
     layout_id,
     style_id,
 ):
     """Run evaluation rollouts and collect statistics."""
     import torch
     import imageio
+    import collections
 
     if policy["type"] == "diffusion":
         device = next(policy["model"].parameters()).device
@@ -420,6 +406,9 @@ def run_evaluation(
         "rewards": [],
     }
 
+    state_history = int(policy.get("state_history", 1))
+    base_state_dim = state_dim // max(state_history, 1)
+
     for ep in range(num_rollouts):
         obs = env.reset()
         ep_meta = env.get_ep_meta()
@@ -427,29 +416,24 @@ def run_evaluation(
 
         ep_reward = 0.0
         success = False
+        state_hist = collections.deque(maxlen=state_history)
 
         for step in range(max_steps):
             # Extract state and predict action
-            state = extract_state(
-                obs, state_dim, state_keys=policy.get("state_keys"), env=env
+            base_state = extract_state(
+                obs, base_state_dim, state_keys=policy.get("state_keys"), env=env
             )
+            state_hist.append(base_state)
+            if len(state_hist) < state_history:
+                pad = [np.zeros_like(base_state) for _ in range(state_history - len(state_hist))]
+                state = np.concatenate(pad + list(state_hist)).astype(np.float32)
+            else:
+                state = np.concatenate(list(state_hist)).astype(np.float32)
             with torch.no_grad():
                 if policy["type"] == "diffusion":
-                    action_seq = sample_diffusion_action(
-                        policy,
-                        state,
-                        device,
-                        deterministic=deterministic,
-                        use_ema=use_ema,
+                    action = sample_diffusion_action(
+                        policy, state, device, deterministic=deterministic
                     )
-                    horizon = int(policy.get("action_horizon", 1))
-                    per_step = policy.get("action_dim_per_step", None)
-                    if per_step is None:
-                        per_step = action_dim
-                    if horizon > 1 and action_seq.shape[0] == horizon * per_step:
-                        action = action_seq.reshape(horizon, per_step)[0]
-                    else:
-                        action = action_seq
                 else:
                     state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
                     action = policy["model"](state_tensor).cpu().numpy().squeeze(0)
@@ -550,11 +534,6 @@ def main():
         action="store_true",
         help="Disable LeRobot->HDF5 action reordering",
     )
-    parser.add_argument(
-        "--no_ema",
-        action="store_true",
-        help="Disable EMA weights if present in checkpoint",
-    )
     args = parser.parse_args()
 
     try:
@@ -571,7 +550,12 @@ def main():
     print("  OpenCabinet - Policy Evaluation")
     print("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -593,7 +577,6 @@ def main():
         seed=args.seed,
         deterministic=not args.stochastic,
         action_reorder=not args.no_action_reorder,
-        use_ema=not args.no_ema,
         layout_id=args.layout_id,
         style_id=args.style_id,
     )
