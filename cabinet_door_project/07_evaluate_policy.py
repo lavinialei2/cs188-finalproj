@@ -509,7 +509,7 @@ def main():
         "--video_path",
         type=str,
         default=None,
-        help="Path to save evaluation video (optional)",
+        help="Path to save evaluation video (optional). Defaults to a file under cabinet_door_project/eval_videos/",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
@@ -545,6 +545,12 @@ def main():
     if (args.layout_id is None) != (args.style_id is None):
         print("ERROR: --layout_id and --style_id must be provided together.")
         sys.exit(1)
+
+    if args.video_path is None:
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        out_dir = os.path.join(os.path.dirname(__file__), "eval_videos")
+        os.makedirs(out_dir, exist_ok=True)
+        args.video_path = os.path.join(out_dir, f"eval_{ts}.mp4")
 
     print("=" * 60)
     print("  OpenCabinet - Policy Evaluation")
