@@ -1,24 +1,20 @@
 # Cabinet Door Opening Robot - CS 188 Starter Project
 
-### Disclaimer
-
-This project was designed for CS 188 - Intro to Robotics as a template starter project. If you have any issues with the codebase, please email me at holdengs @ cs.ucla.edu!
-
 ## Overview
 
-In this project you will build a robot that learns to open kitchen cabinet doors
-using **RoboCasa365**, a large-scale simulation benchmark for everyday robot
-tasks. You will progress from understanding the simulation environment, to
-collecting demonstrations, to training a neural-network policy that controls the
-robot autonomously.
+This repo documents a completed pipeline for training a robot policy to open
+kitchen cabinet doors in **RoboCasa365**, a large-scale simulation benchmark
+for everyday manipulation tasks. The work covers environment inspection,
+demonstration playback, dataset augmentation, and training/evaluating a
+diffusion-based policy that controls the PandaOmron robot autonomously.
 
-### What you will learn
+### What this includes
 
-1. How robotic manipulation environments are structured (MuJoCo + robosuite + RoboCasa)
-2. How the `OpenCabinet` task works -- sensors, actions, success criteria
-3. How to collect and use demonstration datasets (human + MimicGen)
-4. How to train a behavior-cloning policy from demonstrations
-5. How to evaluate your trained policy in simulation
+1. How the manipulation environment is structured (MuJoCo + robosuite + RoboCasa)
+2. The `OpenCabinet` task setup: sensors, actions, and success criteria
+3. Demonstration datasets (human + MimicGen) and how they are used
+4. Training a state-based diffusion policy with a 1D U‑Net backbone
+5. Evaluating trained policies in simulation
 
 ### The robot
 
@@ -161,40 +157,95 @@ python 05_playback_demonstrations.py
 Visualize the downloaded demonstrations to see how an expert opens cabinet
 doors. This is the data your policy will learn from.
 
+### Step 5b: Augment the Dataset with Handle Features
+
+```bash
+python 05b_augment_handle_data.py
+```
+
+The raw LeRobot parquet files do **not** include the cabinet handle position or
+door hinge information, which are crucial for state-only policies. This script:
+- Replays each demo’s saved MuJoCo state sequence from `extras/episode_*`
+- Finds the cabinet’s handle body and door joints
+- Computes per‑timestep features:
+  - `observation.handle_pos` (3D world position)
+  - `observation.handle_to_eef_pos` (handle position relative to end effector)
+  - `observation.door_openness` (normalized door joint value)
+  - `observation.handle_xaxis` (handle x‑axis direction)
+  - `observation.hinge_direction` (+1 right‑opening, ‑1 left‑opening)
+- Writes **augmented parquet files** to `dataset_path/augmented/`
+
+Training auto‑detects these augmented files and includes them in the state
+vector, so you don’t have to modify training scripts beyond running this step.
+
 ### Step 6: Train a Policy
 
 ```bash
 python 06_train_policy.py
-python 06_train_policy.py --config configs/diffusion_policy.yaml
 ```
 
-Trains the starter-code diffusion policy defined by
-`configs/diffusion_policy.yaml`. This implementation stays inside the project
-structure and ports over the core diffusion-policy logic for low-dimensional
-state observations:
-- condition on the last `n_obs_steps` observations
-- predict an action chunk of length `horizon`
-- train with Gaussian corruption and noise prediction
-- evaluate with receding-horizon denoising and action chunk execution
+This repo now trains a **1D Conv U-Net diffusion policy** directly from
+low-dimensional state observations (no video). Key updates from the starter code:
+- **State augmentation**: uses the handle features produced by `05b_augment_handle_data.py`
+- **Normalization**: saves mean/std to the checkpoint and reuses them at eval
+- **State history**: optional temporal stacking via `--state_history`
+- **MPS support**: Apple Silicon Macs use `mps` automatically when available
 
-Legacy options:
-- `--legacy` runs the original lightweight MLP pipeline from the starter file.
+Example command that trained the current model:
 
-On Apple Silicon Macs (M-series), the script will use the MPS backend when available.
+```bash
+python cabinet_door_project/06_train_policy.py \
+  --epochs 100 --batch_size 64 --lr 1e-4 \
+  --diffusion_steps 50 \
+  --unet_channels 128 --unet_channel_mults 1,2,4,8 \
+  --state_history 6 \
+  --max_episodes -1
+```
 
-Use only config files for tuning: edit
-`cabinet_door_project/configs/diffusion_policy.yaml` and rerun
-`python 06_train_policy.py`.
+Argument overview:
+- `--epochs` number of training epochs
+- `--batch_size` batch size per step
+- `--lr` AdamW learning rate
+- `--diffusion_steps` number of diffusion timesteps
+- `--unet_channels` base channel width for the 1D U-Net
+- `--unet_channel_mults` channel multipliers per U-Net level
+- `--state_history` number of past states to stack per input
+- `--max_episodes` limit dataset episodes (`-1` = all episodes)
+
+On Apple Silicon Macs (M‑series), the script will use the MPS backend when available.
 
 ### Step 7: Evaluate Your Policy
 
 ```bash
-python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt
-python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt --split target --num_rollouts 20
+python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt
+python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt --split target --num_rollouts 20
 ```
 
-The evaluator uses observation history and receding-horizon action chunks for
-the diffusion model, so its inference path matches the training setup.
+Evaluation updates:
+- **Success criterion**: counts success if **any one cabinet door** is open
+- **State alignment**: uses the same state keys and normalization from training
+- **Action ordering**: reorders LeRobot actions to the env’s expected layout
+- **Video output**: defaults to `cabinet_door_project/eval_videos/eval_<timestamp>.mp4`
+- **Forced layout/style**: use `--layout_id` and `--style_id`
+
+Common eval flags:
+- `--max_steps` max steps per episode
+- `--num_rollouts` number of episodes
+- `--split` pretrain or target
+- `--layout_id` and `--style_id` to lock a specific kitchen scene
+- `--stochastic` to enable stochastic diffusion sampling
+
+Example layout/style test:
+
+```bash
+python cabinet_door_project/07_evaluate_policy.py \
+  --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt \
+  --layout_id 27 --style_id 21 \
+  --num_rollouts 1 --max_steps 1200
+```
+
+The model trained with the command above achieved a **6/20** success rate in
+your evaluation run, using the “one door open” success criterion.
 
 ---
 
@@ -278,70 +329,6 @@ dataset/
   |  - Contact dynamics, rendering, sensors        |
   +------------------------------------------------+
 ```
-
----
-
-## Research Directions
-
-The legacy MLP baseline in `06_train_policy.py` is intentionally simple and
-will usually fail on OpenCabinet. The default starter-code diffusion model is
-meaningfully stronger, but still much smaller than the full image-conditioned
-Diffusion Policy systems in the paper. Three practical next steps:
-fun directions to improve the model:
-
-### Minimal Diffusion Policy
-
-Replace the direct-regression MLP with a diffusion-based action generator.
-The core loop is to corrupt ground-truth actions with Gaussian noise,
-train the network to predict that noise conditioned on the current state, and
-at inference iteratively denoise from pure noise to produce an action. This
-properly handles multi-modal demonstrations (e.g., approaching the handle from
-the left vs. right) that MSE loss averages into useless mean actions.
-See [Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) for the
-full approach — a minimal version can be built in ~100 lines on top of the
-existing MLP backbone.
-
-### DAgger (Online Correction)
-
-Script 03 already provides keyboard teleoperation. I have it set up with a DAgger mode that may or may not be kinda buggy. Use it to close the loop:
-train a policy, roll it out, then have a human take over and correct the robot
-whenever it fails. Aggregate these corrections into the training set and
-retrain. This directly attacks distribution shift — the fundamental reason
-offline BC degrades at test time — by collecting data in the states the policy
-actually visits. Even one or two rounds of DAgger can dramatically improve
-robustness. See [Ross et al., 2011](https://arxiv.org/abs/1011.0686).
-
-### Action Chunking
-
-Instead of predicting one action per timestep, predict the next *K* actions at
-once and execute them open-loop before re-planning. This is the key idea behind
-ACT ([Zhao et al., 2023](https://arxiv.org/abs/2304.13705)) and directly fixes
-the jerky, temporally incoherent behavior of single-step BC. Fair warning, though, this will probably require a more sophisticated model (Transformer, Diffusion or other) to provide real benefits. Implementation is
-straightforward: widen the output head to `K * action_dim`, train with the same
-MSE loss over the full chunk, and add a small FIFO buffer at inference. Try
-sweeping K = 4, 8, 16 and compare smoothness and success rate.
-
-### Other Ideas
-- Gaussian Mixture Model for output logits. Can ameliorate the MSE multimodality issue.
-- Vision Transformer. Will need a beefier computer to see benefits but definitely can improve policy at scale.
-- Hooking in an existing VLM and experimenting with zero-shot inference.
-
----
-
-## Troubleshooting
-
-I'll continually update this section as students find bugs in the system. Please, let me know if you encounter issues!
-
-| Problem | Solution |
-|---------|----------|
-| `MuJoCo version must be 3.3.1` | `pip install mujoco==3.3.1` |
-| `numpy version must be 2.2.5` | `pip install numpy==2.2.5` |
-| Rendering crashes on Mac | Use `mjpython` instead of `python` |
-| `GLFW error` on headless server | Set `export MUJOCO_GL=egl` or `osmesa` |
-| Out of GPU memory during training | Reduce batch size in `configs/diffusion_policy.yaml` |
-| Kitchen assets not found | Run `python -m robocasa.scripts.download_kitchen_assets` |
-
----
 
 ## References
 
